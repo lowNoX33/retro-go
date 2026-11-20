@@ -2012,6 +2012,46 @@ static rg_gui_event_t app_options_cb(rg_gui_option_t *option, rg_gui_event_t eve
     return RG_DIALOG_VOID;
 }
 
+static rg_gui_event_t save_game_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    if (event == RG_DIALOG_ENTER)
+    {
+        int slot = rg_gui_savestate_menu(_("Save"), rg_system_get_app()->romPath);
+        if (slot < 0)
+            return RG_DIALOG_REDRAW; // Cancelled, stay in the options menu
+        if (!rg_emu_save_state(slot))
+            rg_gui_alert(_("Save game"), _("Save failed!"));
+        return RG_DIALOG_CANCEL; // Close the options menu and go back to the game
+    }
+    return RG_DIALOG_VOID;
+}
+
+static rg_gui_event_t quit_game_cb(rg_gui_option_t *option, rg_gui_event_t event)
+{
+    if (event == RG_DIALOG_ENTER)
+    {
+        const rg_gui_option_t choices[] = {
+            {1, _("Save & Quit"),       NULL, RG_DIALOG_FLAG_NORMAL, NULL},
+            {2, _("Quit without saving"), NULL, RG_DIALOG_FLAG_NORMAL, NULL},
+            RG_DIALOG_END,
+        };
+        int sel = rg_gui_dialog(_("Quit game?"), choices, 0);
+        if (sel == 1)
+        {
+            int slot = rg_gui_savestate_menu(_("Save"), rg_system_get_app()->romPath);
+            if (slot < 0 || !rg_emu_save_state(slot))
+                return RG_DIALOG_REDRAW; // Don't quit if the save was cancelled or failed
+        }
+        else if (sel != 2)
+        {
+            return RG_DIALOG_REDRAW;
+        }
+        rg_settings_commit();
+        rg_system_exit();
+    }
+    return RG_DIALOG_VOID;
+}
+
 void rg_gui_options_menu(void)
 {
     rg_gui_option_t options[20] = {
@@ -2038,6 +2078,8 @@ void rg_gui_options_menu(void)
         RG_DIALOG_END,
     };
     const rg_gui_option_t game_options[] = {
+        {0, _("Save game"),     NULL, RG_DIALOG_FLAG_NORMAL, &save_game_cb},
+        {0, _("Quit game"),     NULL, RG_DIALOG_FLAG_NORMAL, &quit_game_cb},
         {0, _("Scaling"),       "-", RG_DIALOG_FLAG_NORMAL, &scaling_update_cb},
         {0, _("Factor"),        "-", RG_DIALOG_FLAG_HIDDEN, &custom_zoom_cb},
         {0, _("Filter"),        "-", RG_DIALOG_FLAG_NORMAL, &filter_update_cb},

@@ -33,6 +33,8 @@ ESP-IDF's `idf.py` isn't capable of managing multiple applications in one projec
 
 For brevity, all the commands listed in this document omit additional flags that you will likely need, such as `--target` and `--port`. Those two flags can also be specified in the environment as `RG_TOOL_TARGET` and `RG_TOOL_PORT`, respectively.
 
+The default device target is `esp32-s3-devkit` (ESP32-S3). Set `--target` or `RG_TOOL_TARGET` to select a different device.
+
 Run `python rg_tool.py --help` to see all available flags and commands.
 
 

@@ -135,7 +135,73 @@ bool rg_input_read_gamepad_raw(uint32_t *out)
 
 #if defined(RG_GAMEPAD_I2C_MAP)
     uint32_t buttons = 0;
-#if defined(RG_I2C_GPIO_DRIVER)
+#if defined(RG_I2C_GPIO_DRIVER) && RG_I2C_GPIO_DRIVER == 4 // PCF8575
+    // The PCF8575 has no registers: a single 2-byte read returns P00-P07 then P10-P17.
+    // A failed read is not treated as "all buttons released" right away, otherwise a
+    // single glitch on the bus makes buttons drop out mid-game. We hold the last good
+    // value for a few polls and only give up if the expander stays unreachable.
+    //
+    // The address pins (A0-A2) may be left floating, in which case the chip can answer anywhere
+    // in 0x20-0x27 (or move around). When reads keep failing we stop hammering the old address
+    // (each failure logs an error) and instead quietly probe 0x20-0x27 every ~250ms.
+    static uint32_t last_good_buttons = 0xFFFF;
+    // Start in search mode so the first poll quietly locates the chip instead of logging errors.
+    static int failed_reads = 6;
+    static int pcf_addr = RG_I2C_GPIO_ADDR;
+    static int search_countdown = 0;
+    static bool reported_missing = false;
+    uint8_t data[2];
+    bool read_ok = false;
+    if (failed_reads <= 5)
+    {
+        read_ok = rg_i2c_read(pcf_addr, -1, &data, 2);
+    }
+    else if (--search_countdown <= 0)
+    {
+        search_countdown = 25; // input task polls every 10ms
+        for (int i = 0; i < 8; ++i)
+        {
+            int addr = 0x20 + ((pcf_addr - 0x20 + i) & 7); // Try the current address first
+            if (rg_i2c_probe(addr))
+            {
+                static bool found_once = false;
+                if (!found_once)
+                    RG_LOGI("PCF8575 buttons at 0x%02X.\n", addr);
+                else if (addr != pcf_addr)
+                    RG_LOGW("PCF8575 moved to 0x%02X (was 0x%02X). Tie A0-A2 to GND to fix it at 0x20.\n", addr, pcf_addr);
+                else
+                    RG_LOGI("PCF8575 is responding again at 0x%02X.\n", addr);
+                found_once = true;
+                pcf_addr = addr;
+                read_ok = rg_i2c_read(pcf_addr, -1, &data, 2);
+                reported_missing = false;
+                break;
+            }
+        }
+        if (!read_ok && !reported_missing)
+        {
+            RG_LOGE("PCF8575 not found at 0x20-0x27! Check power and SDA/SCL wiring.\n");
+            reported_missing = true;
+        }
+    }
+    if (read_ok)
+    {
+        last_good_buttons = (data[1] << 8) | data[0];
+        failed_reads = 0;
+    }
+    else if (++failed_reads == 6)
+    {
+        RG_LOGE("PCF8575 not responding at 0x%02X, searching 0x20-0x27...\n", pcf_addr);
+        last_good_buttons = 0xFFFF; // Expander is gone, report everything as released
+        search_countdown = 0;
+    }
+    else if (failed_reads > 1000000)
+    {
+        failed_reads = 6; // Avoid overflow while still searching
+    }
+    {
+        buttons = last_good_buttons;
+#elif defined(RG_I2C_GPIO_DRIVER)
     int data0 = rg_i2c_gpio_read_port(0), data1 = rg_i2c_gpio_read_port(1);
     if (data0 > -1) // && data1 > -1)
     {
@@ -367,8 +433,11 @@ void rg_input_init(void)
 void rg_input_deinit(void)
 {
     input_task_running = false;
-    // while (gamepad_state != -1)
-    //     rg_task_yield();
+    // Wait (briefly) for the input task to actually stop. Otherwise it can still be in the
+    // middle of an I2C read when the I2C driver is removed and the chip reboots into the
+    // next app, which leaves the button expander hanging and buttons dead in the game.
+    for (int i = 0; i < 20 && gamepad_state != (uint32_t)-1; ++i)
+        rg_task_delay(10);
     RG_LOGI("Input terminated.\n");
 }
 

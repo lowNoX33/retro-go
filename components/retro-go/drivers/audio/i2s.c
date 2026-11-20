@@ -12,6 +12,79 @@
 #include <driver/gpio.h>
 #include <driver/i2s.h>
 
+static struct {
+    const char *last_error;
+    int device;
+    int volume;
+    bool muted;
+} state;
+
+#ifdef RG_AUDIO_USE_ES8311
+#include "rg_i2c.h"
+
+#define ES8311_I2C_ADDRESS 0x18
+
+static bool es8311_configure_sample_rate(int sample_rate)
+{
+    if (sample_rate < 8000 || sample_rate > 96000)
+    {
+        state.last_error = "ES8311 supports sample rates from 8000 to 96000 Hz";
+        return false;
+    }
+
+    // These dividers support the I2S driver's 256x-Fs MCLK for 16-bit stereo.
+    static const uint8_t clock_registers[][2] = {
+        {0x01, 0x3F}, {0x02, 0x00}, {0x03, 0x10}, {0x04, 0x10},
+        {0x05, 0x00}, {0x06, 0x03}, {0x07, 0x00}, {0x08, 0xFF},
+        {0x09, 0x0C}, {0x0A, 0x0C},
+    };
+
+    for (size_t i = 0; i < RG_COUNT(clock_registers); ++i)
+    {
+        if (!rg_i2c_write_byte(ES8311_I2C_ADDRESS, clock_registers[i][0], clock_registers[i][1]))
+        {
+            state.last_error = "Failed to configure ES8311 clock over I2C";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool es8311_init_codec(int sample_rate)
+{
+    static const uint8_t output_registers[][2] = {
+        {0x0D, 0x01}, {0x0E, 0x02}, {0x12, 0x00}, {0x13, 0x10},
+        {0x1C, 0x6A}, {0x32, 0xFF}, {0x37, 0x08},
+    };
+
+    if (!rg_i2c_init() ||
+        !rg_i2c_write_byte(ES8311_I2C_ADDRESS, 0x00, 0x1F))
+    {
+        state.last_error = "Failed to reset ES8311 over I2C";
+        return false;
+    }
+    rg_usleep(20000);
+    if (!rg_i2c_write_byte(ES8311_I2C_ADDRESS, 0x00, 0x00) ||
+        !rg_i2c_write_byte(ES8311_I2C_ADDRESS, 0x00, 0x80) ||
+        !es8311_configure_sample_rate(sample_rate))
+    {
+        if (!state.last_error)
+            state.last_error = "Failed to start ES8311";
+        return false;
+    }
+
+    for (size_t i = 0; i < RG_COUNT(output_registers); ++i)
+    {
+        if (!rg_i2c_write_byte(ES8311_I2C_ADDRESS, output_registers[i][0], output_registers[i][1]))
+        {
+            state.last_error = "Failed to configure ES8311 output over I2C";
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 #ifdef RG_GPIO_SND_AMP_ENABLE_INVERT
 #define MUTE_ENABLE 1
 #define MUTE_DISABLE 0
@@ -26,22 +99,24 @@
 #define DMA_BUFFER_COUNT 4
 #define DMA_BUFFER_LEN 180
 
-static struct {
-    const char *last_error;
-    int device;
-    int volume;
-    bool muted;
-} state;
-
 static bool driver_init(int device, int sample_rate)
 {
+    esp_err_t ret = ESP_OK;
+    bool driver_installed = false;
+
     state.last_error = NULL;
     state.device = device;
+
+    #ifdef RG_GPIO_SND_AMP_ENABLE
+    gpio_reset_pin(RG_GPIO_SND_AMP_ENABLE);
+    gpio_set_level(RG_GPIO_SND_AMP_ENABLE, MUTE_ENABLE);
+    gpio_set_direction(RG_GPIO_SND_AMP_ENABLE, GPIO_MODE_OUTPUT);
+    #endif
 
     if (state.device == 0)
     {
     #if RG_AUDIO_USE_INT_DAC
-        esp_err_t ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
+        ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
             .mode = I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN,
             .sample_rate = sample_rate,
             .bits_per_sample = 16,
@@ -52,9 +127,10 @@ static bool driver_init(int device, int sample_rate)
             .dma_buf_len = DMA_BUFFER_LEN,
         }, 0, NULL);
         if (ret == ESP_OK)
+        {
+            driver_installed = true;
             ret = i2s_set_dac_mode(RG_AUDIO_USE_INT_DAC);
-        if (ret != ESP_OK)
-            state.last_error = esp_err_to_name(ret);
+        }
     #else
         state.last_error = "This device does not support internal DAC mode!";
     #endif
@@ -62,7 +138,7 @@ static bool driver_init(int device, int sample_rate)
     else if (state.device == 1)
     {
     #if RG_AUDIO_USE_EXT_DAC
-        esp_err_t ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
+        ret = i2s_driver_install(I2S_NUM_0, &(i2s_config_t){
             .mode = I2S_MODE_MASTER | I2S_MODE_TX,
             .sample_rate = sample_rate,
             .bits_per_sample = 16,
@@ -77,31 +153,64 @@ static bool driver_init(int device, int sample_rate)
         }, 0, NULL);
         if (ret == ESP_OK)
         {
+            driver_installed = true;
             ret = i2s_set_pin(I2S_NUM_0, &(i2s_pin_config_t) {
-                .mck_io_num = GPIO_NUM_NC,
+                .mck_io_num =
+                #ifdef RG_AUDIO_USE_ES8311
+                    RG_GPIO_SND_I2S_MCK,
+                #else
+                    GPIO_NUM_NC,
+                #endif
                 .bck_io_num = RG_GPIO_SND_I2S_BCK,
                 .ws_io_num = RG_GPIO_SND_I2S_WS,
                 .data_out_num = RG_GPIO_SND_I2S_DATA,
                 .data_in_num = GPIO_NUM_NC
             });
         }
-        if (ret != ESP_OK)
-            state.last_error = esp_err_to_name(ret);
+#ifdef RG_AUDIO_USE_ES8311
+        if (ret == ESP_OK && !es8311_init_codec(sample_rate))
+        {
+            ret = ESP_FAIL;
+        }
+#endif
     #else
         state.last_error = "This device does not support external DAC mode!";
     #endif
     }
-    #ifdef RG_GPIO_SND_AMP_ENABLE
-        gpio_reset_pin(RG_GPIO_SND_AMP_ENABLE);
+    else
+    {
+        state.last_error = "Invalid I2S device";
+    }
+
+    if (ret != ESP_OK)
+    {
+        if (!state.last_error)
+            state.last_error = esp_err_to_name(ret);
+        if (driver_installed)
+            i2s_driver_uninstall(I2S_NUM_0);
+        #ifdef RG_GPIO_SND_I2S_MCK
+        gpio_reset_pin(RG_GPIO_SND_I2S_MCK);
+        #endif
+        gpio_reset_pin(RG_GPIO_SND_I2S_BCK);
+        gpio_reset_pin(RG_GPIO_SND_I2S_DATA);
+        gpio_reset_pin(RG_GPIO_SND_I2S_WS);
+        #ifdef RG_GPIO_SND_AMP_ENABLE
         gpio_set_level(RG_GPIO_SND_AMP_ENABLE, MUTE_ENABLE);
-        gpio_set_direction(RG_GPIO_SND_AMP_ENABLE, GPIO_MODE_OUTPUT);
-    #endif
+        #endif
+        return false;
+    }
     return state.last_error == NULL;
 }
 
 static bool driver_set_sample_rates(int sampleRate)
 {
-    return i2s_set_sample_rates(I2S_NUM_0, sampleRate) == ESP_OK;
+    if (i2s_set_sample_rates(I2S_NUM_0, sampleRate) != ESP_OK)
+        return false;
+#ifdef RG_AUDIO_USE_ES8311
+    return es8311_configure_sample_rate(sampleRate);
+#else
+    return true;
+#endif
 }
 
 static bool driver_deinit(void)
@@ -116,6 +225,9 @@ static bool driver_deinit(void)
     else if (state.device == 1)
     {
     #if RG_AUDIO_USE_EXT_DAC
+        #ifdef RG_GPIO_SND_I2S_MCK
+        gpio_reset_pin(RG_GPIO_SND_I2S_MCK);
+        #endif
         gpio_reset_pin(RG_GPIO_SND_I2S_BCK);
         gpio_reset_pin(RG_GPIO_SND_I2S_DATA);
         gpio_reset_pin(RG_GPIO_SND_I2S_WS);
@@ -199,7 +311,7 @@ static bool driver_set_mute(bool mute)
 
 static bool driver_set_volume(int volume)
 {
-    state.volume = volume;
+    state.volume = RG_MIN(RG_MAX(volume, 0), 100);
     return true;
 }
 

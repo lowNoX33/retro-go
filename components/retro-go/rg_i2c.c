@@ -2,14 +2,66 @@
 #include "rg_i2c.h"
 
 #include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 #if defined(ESP_PLATFORM) && defined(RG_GPIO_I2C_SDA) && defined(RG_GPIO_I2C_SCL)
 #include <driver/i2c.h>
+#include <driver/gpio.h>
 #include <esp_err.h>
 #define USE_I2C_DRIVER 1
 #endif
 
+#ifndef RG_I2C_SPEED
+#define RG_I2C_SPEED 400000
+#endif
+
 static bool i2c_initialized = false;
+
+#if USE_I2C_DRIVER
+// If the ESP32 resets in the middle of an I2C transfer (which happens when retro-go switches
+// from the launcher to a game, or after a crash), a slave such as the button expander can be
+// left holding SDA low while it waits for clock pulses that never come. Every transfer after
+// the reboot then fails, so no buttons work. Clocking SCL until SDA is released and sending a
+// STOP condition puts every device on the bus back into a known idle state.
+static void i2c_bus_recover(gpio_num_t sda, gpio_num_t scl)
+{
+    gpio_reset_pin(sda);
+    gpio_reset_pin(scl);
+    gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_direction(scl, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+    gpio_set_level(sda, 1);
+    gpio_set_level(scl, 1);
+    rg_usleep(10);
+
+    if (gpio_get_level(sda) == 0)
+    {
+        RG_LOGW("I2C bus stuck (SDA held low), attempting recovery...\n");
+        for (int i = 0; i < 9 && gpio_get_level(sda) == 0; ++i)
+        {
+            gpio_set_level(scl, 0);
+            rg_usleep(5);
+            gpio_set_level(scl, 1);
+            rg_usleep(5);
+        }
+    }
+
+    // STOP condition: SDA goes high while SCL is high
+    gpio_set_level(scl, 0);
+    rg_usleep(5);
+    gpio_set_level(sda, 0);
+    rg_usleep(5);
+    gpio_set_level(scl, 1);
+    rg_usleep(5);
+    gpio_set_level(sda, 1);
+    rg_usleep(5);
+
+    if (gpio_get_level(sda) == 0 || gpio_get_level(scl) == 0)
+        RG_LOGE("I2C bus is still stuck after recovery! Check wiring/pull-ups.\n");
+}
+#endif
 
 #define TRY(x)                 \
     if ((err = (x)) != ESP_OK) \
@@ -27,17 +79,20 @@ bool rg_i2c_init(void)
         .scl_io_num = RG_GPIO_I2C_SCL,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
+        .master.clk_speed = RG_I2C_SPEED,
     };
     esp_err_t err = ESP_FAIL;
 
     if (i2c_initialized)
         return true;
 
+    i2c_bus_recover(RG_GPIO_I2C_SDA, RG_GPIO_I2C_SCL);
+
     TRY(i2c_param_config(I2C_NUM_0, &i2c_config));
     TRY(i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0));
-    RG_LOGI("I2C driver ready (SDA:%d SCL:%d).\n", i2c_config.sda_io_num, i2c_config.scl_io_num);
+    RG_LOGI("I2C driver ready (SDA:%d SCL:%d, %d Hz).\n", i2c_config.sda_io_num, i2c_config.scl_io_num, RG_I2C_SPEED);
     i2c_initialized = true;
+    rg_i2c_scan();
     return true;
 fail:
     RG_LOGE("Failed to initialize I2C driver. err=0x%x\n", err);
@@ -56,6 +111,46 @@ bool rg_i2c_deinit(void)
 #endif
     i2c_initialized = false;
     return true;
+}
+
+// Returns true if a device ACKs at `addr`. Unlike rg_i2c_read, a missing device is not logged
+// as an error, so this is safe to call repeatedly when searching for a device.
+bool rg_i2c_probe(uint8_t addr)
+{
+#if USE_I2C_DRIVER
+    if (!i2c_initialized)
+        return false;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (!cmd)
+        return false;
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(20));
+    i2c_cmd_link_delete(cmd);
+    return err == ESP_OK;
+#else
+    return false;
+#endif
+}
+
+// Logs every address that responds on the bus. Useful to diagnose wiring/address problems.
+int rg_i2c_scan(void)
+{
+    char found[128] = "";
+    int count = 0;
+    for (int addr = 0x08; addr < 0x78; ++addr)
+    {
+        if (rg_i2c_probe(addr))
+        {
+            size_t len = strlen(found);
+            if (len < sizeof(found) - 6)
+                snprintf(found + len, sizeof(found) - len, " 0x%02X", addr);
+            count++;
+        }
+    }
+    RG_LOGI("I2C scan: %d device(s) found:%s\n", count, count ? found : " none");
+    return count;
 }
 
 bool rg_i2c_read(uint8_t addr, int reg, void *read_data, size_t read_len)
@@ -201,6 +296,22 @@ bool rg_i2c_gpio_init(void)
     if (!i2c_initialized && !rg_i2c_init())
         return false;
 
+#if RG_I2C_GPIO_DRIVER == 4 || RG_I2C_GPIO_DRIVER == 5 // PCF8575/PCF8574
+    // If the address pins are floating the chip may answer anywhere in 0x20-0x27, look for it quietly.
+    if (!rg_i2c_probe(gpio_address))
+    {
+        for (int addr = 0x20; addr <= 0x27; ++addr)
+        {
+            if (rg_i2c_probe(addr))
+            {
+                RG_LOGW("Extender found at 0x%02X instead of 0x%02X (address pins floating?).\n", addr, gpio_address);
+                gpio_address = addr;
+                break;
+            }
+        }
+    }
+#endif
+
     // Configure extender-specific registers if needed (disable open-drain, interrupts, inversion, etc)
     for (size_t i = 0; (int)i < (int)RG_COUNT(gpio_init_seq); ++i)
     {
@@ -269,7 +380,7 @@ bool rg_i2c_gpio_configure_port(int port, uint8_t mask, rg_gpio_mode_t mode)
 
 int rg_i2c_gpio_read_port(int port)
 {
-    if (port < 0 || port >= gpio_ports_count)
+    if (!gpio_initialized || port < 0 || port >= gpio_ports_count)
         return -1;
 #if RG_I2C_GPIO_DRIVER == 4 || RG_I2C_GPIO_DRIVER == 5 // PCF8575/PCF8574
     uint8_t values[gpio_ports_count];
@@ -295,6 +406,8 @@ bool rg_i2c_gpio_write_port(int port, uint8_t value)
 
 bool rg_i2c_gpio_set_direction(int pin, rg_gpio_mode_t mode)
 {
+    if (!gpio_initialized)
+        return false;
     return rg_i2c_gpio_configure_port(pin >> 3, 1 << (pin & 7), mode);
 }
 
