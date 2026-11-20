@@ -24,6 +24,12 @@ static struct {
 
 #define ES8311_I2C_ADDRESS 0x18
 
+// ES8311 DAC output level (register 0x32): 0.5 dB per step, 0xBF = 0 dB, 0xFF = +32 dB.
+// Lowering it by 12 steps (6 dB) halves the output amplitude at every volume setting.
+#ifndef RG_AUDIO_ES8311_DAC_VOLUME
+#define RG_AUDIO_ES8311_DAC_VOLUME 0xFF
+#endif
+
 static bool es8311_configure_sample_rate(int sample_rate)
 {
     if (sample_rate < 8000 || sample_rate > 96000)
@@ -54,7 +60,7 @@ static bool es8311_init_codec(int sample_rate)
 {
     static const uint8_t output_registers[][2] = {
         {0x0D, 0x01}, {0x0E, 0x02}, {0x12, 0x00}, {0x13, 0x10},
-        {0x1C, 0x6A}, {0x32, 0xFF}, {0x37, 0x08},
+        {0x1C, 0x6A}, {0x32, RG_AUDIO_ES8311_DAC_VOLUME}, {0x37, 0x08},
     };
 
     if (!rg_i2c_init() ||

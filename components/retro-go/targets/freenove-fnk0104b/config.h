@@ -10,6 +10,7 @@
 #define RG_AUDIO_USE_INT_DAC        0
 #define RG_AUDIO_USE_EXT_DAC        1
 #define RG_AUDIO_USE_ES8311         1
+#define RG_AUDIO_ES8311_DAC_VOLUME  0xF3 // 6 dB below max (0xFF): half the output level
 
 // Display is landscape (320x240), matching Freenove's rotation 1 setup.
 #define RG_SCREEN_DRIVER            0
